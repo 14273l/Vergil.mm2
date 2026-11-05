@@ -1,0 +1,702 @@
+
+-- stop ask what the menu button is pls yo  its RightShift: menu | X: stop and return to the floor.
+-- Dedicated collectible farming. Uses the requested Vergil UI library.
+local ENV=(getgenv and getgenv()) or _G
+if ENV.VergilAutofarm and ENV.VergilAutofarm.Unload then pcall(ENV.VergilAutofarm.Unload) end
+if game.PlaceId~=142823291 then warn("[Vergil Autofarm] MM2 only.");return end
+
+local Players=game:GetService("Players")
+local Run=game:GetService("RunService")
+local Input=game:GetService("UserInputService")
+local RS=game:GetService("ReplicatedStorage")
+local Tags=game:GetService("CollectionService")
+local Tween=game:GetService("TweenService")
+local Http=game:GetService("HttpService")
+local VirtualUser=game:GetService("VirtualUser")
+local Player=Players.LocalPlayer
+local VERSION,CONFIG="1.1","vergil_autofarm_settings.json"
+local defaults={
+    Enabled=true,Speed=20,Depth=3.5,ResetOnFull=false,AntiAFK=true,AutoPrestige=false,
+    Reports=false,ReportInterval=300,
+    ReportUser=true,ReportLevel=true,ReportPrestige=true,ReportCollected=true,
+    ReportFarm=true,ReportRate=true,ReportTime=true,ReportRound=true,ReportBag=true,
+    ReportPing=false,ReportServer=false,
+}
+local cfg=table.clone(defaults)
+if type(isfile)=="function" and type(readfile)=="function" then
+    pcall(function()
+        if isfile(CONFIG) then
+            local saved=Http:JSONDecode(readfile(CONFIG))
+            if type(saved)=="table" then
+                for k,v in pairs(defaults) do if type(saved[k])==type(v) then cfg[k]=saved[k] end end
+            end
+        end
+    end)
+end
+local limits={Speed={5,20},Depth={2,5},ReportInterval={30,3600}}
+for key,range in pairs(limits) do
+    if cfg[key]~=cfg[key] then cfg[key]=defaults[key] end
+    cfg[key]=math.clamp(cfg[key],range[1],range[2])
+end
+cfg.Reports=false -- The webhook URL is supplied per session, never saved.
+
+local Library
+do
+    local ok,result=pcall(function()
+        return assert(loadstring(game:HttpGet("https://raw.githubusercontent.com/14273l/Vergil-poopy/refs/heads/main/Library"),"VergilUI"))()
+    end)
+    assert(ok and type(result)=="table","[Vergil Autofarm] UI load failed: "..tostring(result))
+    Library=result
+end
+local exitLibrary=Library.Exit
+Library.BlurEnabled=false;Library.SnowEnabled=false;Library:SetSnowAmount(0)
+
+local S={
+    alive=true,connections={},errors={},phase="Syncing",round=0,own=nil,map=nil,
+    started=os.clock(),status="Starting",busy=false,token=0,kind=nil,target=nil,
+    bags={},caps={},currencies={},total={},farmed={},confirmed=setmetatable({},{__mode="k"}),
+    retry=setmetatable({},{__mode="k"}),ping=0.05,requestAt=-math.huge,requestPending=false,
+    webhook="",reportStatus="No URL set",reportAt=-math.huge,reportNext=0,reportBusy=false,
+    lastAFK=-math.huge,afkOK=nil,previewUntil=0,
+    prestigeStatus="Off",prestigeAt=-math.huge,prestigeAttempts=0,prestigeRequests=0,
+}
+local UI={toggles={},sliders={}}
+local API={Version=VERSION,Config=cfg}
+ENV.VergilAutofarm=API
+local function guard(name,fn,...)
+    if not S.alive then return end
+    local ok,result=pcall(fn,...)
+    if not ok then
+        local e=S.errors[name] or {count=0,last=-math.huge};S.errors[name]=e
+        e.count=e.count+1;e.message=tostring(result)
+        if os.clock()-e.last>8 then e.last=os.clock();warn("[Vergil Autofarm / "..name.."] "..e.message) end
+    end
+    return ok,result
+end
+local function connect(signal,fn)
+    local c=signal:Connect(function(...) guard("event",fn,...) end)
+    S.connections[#S.connections+1]=c
+    return c
+end
+local function new(class,properties,parent)
+    local object=Instance.new(class)
+    for k,v in pairs(properties) do object[k]=v end
+    object.Parent=parent
+    return object
+end
+local function character()
+    local c=Player.Character
+    return c,c and c:FindFirstChild("HumanoidRootPart"),c and c:FindFirstChildOfClass("Humanoid")
+end
+local function aliveInRound()
+    local _,root,hum=character()
+    return S.phase=="Round" and S.own and not S.own.Dead and not S.own.Killed
+        and root~=nil and hum~=nil and hum.Health>0
+end
+local function notify(text)
+    text=tostring(text):gsub("&","&amp;"):gsub("<","&lt;"):gsub(">","&gt;")
+    if S.alive then Library:Notification({Name=text,Time=3}) end
+end
+local function restoreControl()
+    S.hold=nil
+    if S.tween then S.tween:Cancel();S.tween=nil end
+    if S.original then
+        local o=S.original
+        pcall(function() o.hum.PlatformStand=o.platform;o.hum.AutoRotate=o.rotate end)
+        S.original=nil
+    end
+    if S.collisions then
+        for part,value in pairs(S.collisions) do pcall(function() part.CanCollide=value end) end
+        S.collisions=nil
+    end
+    if S.root then pcall(function() S.root.AssemblyLinearVelocity=Vector3.zero end);S.root=nil end
+end
+local function cancel(reason)
+    S.token=S.token+1;S.busy=false;S.kind=nil;S.target=nil
+    S.status=reason or "Stopped"
+    restoreControl()
+end
+API.Unload=function()
+    if not S.alive then return end
+    S.alive=false;cancel("Unloaded")
+    for _,c in ipairs(S.connections) do c:Disconnect() end
+    if S.gui then S.gui:Destroy() end
+    if Library and not Library.Unloaded then pcall(exitLibrary,Library) end
+    if ENV.VergilAutofarm==API then ENV.VergilAutofarm=nil end
+end
+local function beginControl(root,hum)
+    if not S.original then S.original={hum=hum,platform=hum.PlatformStand,rotate=hum.AutoRotate} end
+    S.root=root;hum.PlatformStand=true;hum.AutoRotate=false;hum:Move(Vector3.zero)
+    S.collisions=S.collisions or setmetatable({},{__mode="k"})
+    for _,part in ipairs(Player.Character:GetDescendants()) do
+        if part:IsA("BasePart") then
+            if S.collisions[part]==nil then S.collisions[part]=part.CanCollide end
+            part.CanCollide=false
+        end
+    end
+end
+local function full(id)
+    local cap=id and S.caps[id]
+    return cap and cap>0 and (S.bags[id] or 0)>=cap or false
+end
+local function finished()
+    local ids=next(S.currencies) and S.currencies or S.caps
+    local any=false
+    for id in pairs(ids) do any=true;if not full(id) then return false end end
+    return any
+end
+local function visual(part)
+    local v=part:FindFirstChild("CoinVisual")
+    return v and v:IsA("BasePart") and v or nil
+end
+local function available(part)
+    if not part or not part:IsA("BasePart") or not part:IsDescendantOf(workspace)
+        or part:GetAttribute("RoundEnd")==true or full(part:GetAttribute("CoinID")) then return false end
+    local v=visual(part);local confirmed=S.confirmed[part]
+    if confirmed and typeof(confirmed)=="Instance" and v and confirmed~=v then S.confirmed[part]=nil;confirmed=nil end
+    if confirmed then return false end
+    if v then
+        return v.Transparency<0.95 and v:GetAttribute("Collected")~=true
+            and v:GetAttribute("Delete")~=true and v:GetAttribute("RoundEnd")~=true
+    end
+    return part:GetAttribute("Collected")~=true
+end
+local function coins()
+    local list,seen={},{}
+    local function add(part)
+        if part and part:IsA("BasePart") and part:IsDescendantOf(workspace) and part:GetAttribute("RoundEnd")~=true then
+            local id=part:GetAttribute("CoinID");if type(id)=="string" then S.currencies[id]=true end
+        end
+        if not seen[part] and available(part) then seen[part]=true;list[#list+1]=part end
+    end
+    for _,part in ipairs(Tags:GetTagged("ServerCoinPart")) do add(part) end
+    for _,v in ipairs(Tags:GetTagged("CoinVisual")) do
+        local p=v.Parent
+        if p and p:IsA("BasePart") and (p.Name=="Coin_Server" or Tags:HasTag(p,"ServerCoinPart")) then add(p) end
+    end
+    local container=S.map and S.map:FindFirstChild("CoinContainer")
+    if container then for _,p in ipairs(container:GetChildren()) do if p.Name=="Coin_Server" then add(p) end end end
+    return list
+end
+local function moveTo(root,goal,token,valid)
+    if not S.alive or token~=S.token or not valid() then return false end
+    local distance=(root.Position-goal).Magnitude
+    if distance<0.1 then S.hold=root.CFrame;return true end
+    local speed=math.clamp(cfg.Speed,5,20)
+    local duration=math.max(distance/speed,0.025)
+    S.leg={distance=distance,duration=duration,speed=speed,targetY=goal.Y}
+    local tween=Tween:Create(root,TweenInfo.new(duration,Enum.EasingStyle.Linear),{CFrame=CFrame.new(goal)*root.CFrame.Rotation})
+    S.hold=nil;S.tween=tween;tween:Play()
+    while tween.PlaybackState==Enum.PlaybackState.Playing do
+        if not S.alive or token~=S.token or not valid() then tween:Cancel();break end
+        task.wait(0.025)
+    end
+    local reached=tween.PlaybackState==Enum.PlaybackState.Completed
+    if S.tween==tween then S.tween=nil end
+    if token==S.token then S.hold=root.CFrame end
+    return reached
+end
+local function resetOnFull()
+    if not cfg.Enabled or not cfg.ResetOnFull or S.resetRound==S.round or not aliveInRound() then return end
+    local _,_,hum=character();S.resetRound=S.round;cancel("Bags full · resetting");hum.Health=0
+end
+local function surface(completed)
+    if S.busy or not aliveInRound() then return false end
+    local _,root,hum=character()
+    local height=hum.HipHeight+root.Size.Y/2
+    if hum.RigType==Enum.HumanoidRigType.R6 then
+        local leg=Player.Character:FindFirstChild("Left Leg") or Player.Character:FindFirstChild("Right Leg")
+        height=height+(leg and leg.Size.Y or 2)
+    end
+    local point=S.point
+    if not point then
+        point=hum.FloorMaterial==Enum.Material.Air and root.Position+Vector3.new(0,cfg.Depth,0)
+            or root.Position-Vector3.new(0,height-0.25,0)
+    end
+    if not completed then point=Vector3.new(root.Position.X,point.Y,root.Position.Z) end
+    local params=RaycastParams.new();params.FilterType=Enum.RaycastFilterType.Exclude
+    local ignore={}
+    for _,p in ipairs(Players:GetPlayers()) do if p.Character then ignore[#ignore+1]=p.Character end end
+    local container=S.map and S.map:FindFirstChild("CoinContainer")
+    if container then ignore[#ignore+1]=container end
+    params.FilterDescendantsInstances=ignore
+    local hit=workspace:Raycast(point+Vector3.new(0,2,0),Vector3.new(0,-64,0),params)
+    local goal=hit and hit.Normal.Y>0.35 and Vector3.new(point.X,hit.Position.Y+height+0.2,point.Z)
+        or (S.anchor and S.anchor.Position or point+Vector3.new(0,height,0))
+    S.token=S.token+1;local token=S.token
+    S.busy=true;S.kind="surface";S.target=nil;S.status="Returning to floor"
+    S.surfaceY=goal.Y;beginControl(root,hum)
+    task.spawn(function()
+        local ok,reached=guard("surface movement",moveTo,root,goal,token,aliveInRound)
+        if token~=S.token then return end
+        S.busy=false;S.kind=nil;restoreControl()
+        if ok and reached then
+            S.status=completed and "Bags full · on floor" or "Stopped · on floor"
+            if completed then S.doneRound=S.round;resetOnFull() end
+        end
+    end)
+    return true
+end
+local farmTick
+local function collect(part)
+    if S.busy or not aliveInRound() or not available(part) then return end
+    local _,root,hum=character()
+    S.token=S.token+1;local token=S.token
+    S.busy=true;S.kind="collect";S.target=part
+    S.status=part:GetAttribute("CoinID") or "Collecting"
+    task.spawn(function()
+        local ok=guard("collection",function()
+            if token~=S.token or not available(part) then return end
+            S.anchor=S.anchor or root.CFrame;S.point=part.Position;beginControl(root,hum)
+            local head=Player.Character:FindFirstChild("Head")
+            local contact=head and head:IsA("BasePart") and head or root
+            local reach=contact.Position.Y-root.Position.Y+(contact.Size.Y+part.Size.Y)/2-0.1
+            local depth=math.clamp(math.min(cfg.Depth,reach),0.2,5)
+            local function valid() return aliveInRound() and part.Parent~=nil and available(part) end
+            if not moveTo(root,part.Position-Vector3.new(0,depth,0),token,valid) then return end
+            local id=part:GetAttribute("CoinID");local before=id and S.bags[id] or 0
+            local deadline=os.clock()+math.clamp(S.ping*3+0.15,0.25,0.75)
+            local last=-math.huge
+            while S.alive and token==S.token and part.Parent and os.clock()<deadline do
+                if S.confirmed[part] or (id and (S.bags[id] or 0)>before) then break end
+                if (root.Position-part.Position).Magnitude<6 and os.clock()-last>0.15 and type(firetouchinterest)=="function" then
+                    pcall(function() firetouchinterest(contact,part,0);firetouchinterest(contact,part,1) end)
+                    last=os.clock()
+                end
+                task.wait(0.025)
+            end
+            if not S.confirmed[part] then S.retry[part]=os.clock()+2 end
+        end)
+        if token~=S.token then return end
+        S.busy=false;S.kind=nil;S.target=nil
+        if cfg.Enabled and aliveInRound() then S.hold=root.CFrame else restoreControl() end
+        if not ok and part.Parent then S.retry[part]=os.clock()+2 end
+        if cfg.Enabled then task.defer(function() guard("next coin",farmTick) end) end
+    end)
+end
+farmTick=function()
+    if S.busy or not cfg.Enabled then return end
+    if not aliveInRound() then
+        if S.original then cancel("Waiting for next round") end
+        S.status="Waiting for next round";return
+    end
+    if finished() then
+        if S.doneRound~=S.round then surface(true) else resetOnFull() end
+        return
+    end
+    S.doneRound=nil
+    local _,root=character();local best,distance,retry,earliest=nil,math.huge,nil,math.huge
+    for _,part in ipairs(coins()) do
+        local untilTime=S.retry[part] or 0
+        if untilTime<=os.clock() then
+            local d=(root.Position-part.Position).Magnitude
+            if d<distance then best,distance=part,d end
+        elseif untilTime<earliest then retry,earliest=part,untilTime end
+    end
+    best=best or retry
+    if best then collect(best) else S.status="Waiting for coins to spawn" end
+end
+
+local onSetting
+local function set(key,value)
+    if defaults[key]==nil or type(value)~=type(defaults[key]) then return false end
+    if limits[key] then if value~=value then return false end;value=math.clamp(value,limits[key][1],limits[key][2]) end
+    local old=cfg[key];cfg[key]=value
+    local t=UI.toggles[key];if t and t.Value~=value then t:Set(value) end
+    local s=UI.sliders[key];if s and s.Value~=value then s:Set(value) end
+    if onSetting and old~=value then onSetting(key,value) end
+    return true
+end
+onSetting=function(key,value)
+    if key=="Enabled" and not value then
+        local returnToFloor=S.root~=nil and aliveInRound()
+        cancel("Stopped")
+        if returnToFloor then task.defer(function() if S.alive and not cfg.Enabled and not S.busy then surface(false) end end) end
+    elseif key=="Enabled" and value then
+        task.defer(function() guard("start",farmTick) end)
+    elseif key=="Speed" or key=="Depth" then
+        local returnToFloor=S.root~=nil and aliveInRound()
+        cancel("Updating farm")
+        if cfg.Enabled then task.defer(function() guard("resume",farmTick) end)
+        elseif returnToFloor then task.defer(function() if S.alive and not S.busy then surface(false) end end) end
+    elseif key=="Reports" then
+        if value and S.webhook=="" then set("Reports",false);notify("Set your webhook URL first.") end
+        S.reportNext=os.clock()+cfg.ReportInterval
+    elseif key=="ReportInterval" then S.reportNext=os.clock()+value
+    elseif key=="AutoPrestige" then
+        S.prestigeStatus=value and "Checking level" or "Off"
+        if value then S.prestigeAttempts=0;S.prestigeAt=-math.huge;S.prestigePending=false end
+    end
+end
+local function currencyText(amounts)
+    local keys,total={},0
+    for id,n in pairs(amounts) do keys[#keys+1]=id;total=total+n end
+    table.sort(keys)
+    local lines={}
+    for i=1,math.min(#keys,10) do
+        local id=keys[i];local name=id=="Candy" and "Candies" or (id=="Coin" and "Coins" or id)
+        lines[#lines+1]=string.format("%s: %d",name:gsub("[\r\n]"," "):sub(1,50),amounts[id])
+    end
+    return #lines>0 and table.concat(lines,"\n") or "None yet",total
+end
+local function profile()
+    local p=S.profile or {};local xp=tonumber(p.NewXP) or tonumber(p.XP);local level=tonumber(p.Level)
+    if xp and S.levels then local ok,n=pcall(S.levels.GetLevel,xp);if ok then level=n end end
+    return {level=level,prestige=tonumber(p.Prestige),xp=xp}
+end
+local function canPrestige()
+    local p=profile()
+    return type(p.level)=="number" and p.level>=100 and type(p.prestige)=="number" and p.prestige<10
+end
+local function prestigeTick()
+    if not cfg.AutoPrestige then S.prestigeStatus="Off";return end
+    local p=profile()
+    if S.prestigePending and p.prestige and p.prestige>S.prestigeTier then
+        S.prestigePending=false;S.prestigeAttempts=0
+        notify("Prestige "..p.prestige.." reached.")
+    end
+    if not p.level or p.prestige==nil then S.prestigeStatus="Waiting for profile";return end
+    if p.prestige>=10 then S.prestigeStatus="Maximum prestige (X)";return end
+    if p.level<100 then
+        S.prestigeStatus=string.format("Level %d / needs 100",p.level)
+        S.prestigePending=false;S.prestigeAttempts=0
+        return
+    end
+    if S.prestigeAttempts>0 and os.clock()-S.prestigeAt<30 then S.prestigeStatus="Waiting for prestige update";return end
+    if S.prestigeAttempts>=3 then S.prestigeStatus="Request not confirmed";return end
+    local remotes=RS:FindFirstChild("Remotes")
+    local inventory=remotes and remotes:FindFirstChild("Inventory")
+    local remote=inventory and inventory:FindFirstChild("Prestige")
+    if not remote or not remote:IsA("RemoteEvent") then S.prestigeStatus="Prestige unavailable";return end
+    if not canPrestige() then return end
+    -- Same no-argument request as MM2's native prestige confirmation button.
+    local ok=pcall(function() remote:FireServer() end)
+    S.prestigeAt=os.clock();S.prestigeAttempts=S.prestigeAttempts+1
+    if ok then
+        S.prestigeRequests=S.prestigeRequests+1;S.prestigePending=true;S.prestigeTier=p.prestige
+        S.prestigeStatus="Waiting for prestige update"
+    else S.prestigeStatus="Prestige request failed" end
+end
+local function payload()
+    local p=profile();local elapsed=math.max(1,os.clock()-S.started)
+    local collected,total=currencyText(S.total);local farmed=currencyText(S.farmed);local fields={}
+    local function field(enabled,name,value,inline)
+        if enabled then fields[#fields+1]={name=name,value=tostring(value):sub(1,1024),inline=inline~=false} end
+    end
+    field(cfg.ReportUser,"Account",Player.Name.." ("..Player.DisplayName..")")
+    field(cfg.ReportLevel,"Level",p.level or "Unavailable")
+    field(cfg.ReportPrestige,"Prestige",p.prestige or "Unavailable")
+    field(cfg.ReportCollected,"Session collectibles",collected,false)
+    field(cfg.ReportFarm,"Autofarm collectibles",farmed,false)
+    field(cfg.ReportRate,"Rate",string.format("%.1f / minute",total*60/elapsed))
+    field(cfg.ReportTime,"Session time",string.format("%dh %02dm %02ds",elapsed/3600,elapsed%3600/60,elapsed%60))
+    field(cfg.ReportRound,"Round",string.format("%d · %s · %s",S.round,S.phase,S.map and S.map.Name or "Lobby"))
+    field(cfg.ReportBag,"Current bags",currencyText(S.bags),false)
+    field(cfg.ReportPing,"Ping",string.format("~%d ms RTT",S.ping*2000))
+    field(cfg.ReportServer,"Server",game.JobId,false)
+    return {username="Vergil",allowed_mentions={parse={}},embeds={{title="Vergil Autofarm / MM2",color=11582704,
+        description=#fields>0 and "Farm report" or "No fields selected.",fields=fields,
+        timestamp=os.date("!%Y-%m-%dT%H:%M:%SZ"),footer={text="Confirmed collection events"}}}}
+end
+local function validWebhook(url)
+    return type(url)=="string" and (url:match("^https://discord%.com/api/webhooks/%d+/[%w_%-]+$")~=nil
+        or url:match("^https://discordapp%.com/api/webhooks/%d+/[%w_%-]+$")~=nil
+        or url:match("^https://canary%.discord%.com/api/webhooks/%d+/[%w_%-]+$")~=nil
+        or url:match("^https://ptb%.discord%.com/api/webhooks/%d+/[%w_%-]+$")~=nil)
+end
+local function setWebhook(url)
+    url=tostring(url or ""):match("^%s*(.-)%s*$")
+    if url~="" and not validWebhook(url) then S.reportStatus="Invalid Discord URL";return false end
+    S.webhook=url;S.reportStatus=url=="" and "No URL set" or "URL ready"
+    S.reportNext=os.clock()+cfg.ReportInterval
+    if url=="" then set("Reports",false) end
+    return true
+end
+local function sendReport(manual)
+    if S.reportBusy then return false,"Already sending" end
+    if not manual and not cfg.Reports then return false,"Reports disabled" end
+    if not validWebhook(S.webhook) then S.reportStatus="Set a webhook URL first";S.reportNext=os.clock()+cfg.ReportInterval;return false,S.reportStatus end
+    if os.clock()-S.reportAt<5 then return false,"Please wait before sending again" end
+    local requestFn=request or http_request or (syn and syn.request)
+    if type(requestFn)~="function" then S.reportStatus="HTTP request unavailable";S.reportNext=os.clock()+60;return false,S.reportStatus end
+    local body=Http:JSONEncode(payload());local url=S.webhook
+    S.reportBusy=true;S.reportAt=os.clock();S.reportStatus="Sending…"
+    task.spawn(function()
+        local ok,response=pcall(requestFn,{Url=url,Method="POST",Headers={["Content-Type"]="application/json"},Body=body})
+        S.reportBusy=false;if not S.alive then return end
+        local code=ok and type(response)=="table" and tonumber(response.StatusCode or response.Status) or nil
+        S.reportNext=os.clock()+cfg.ReportInterval
+        if code and code>=200 and code<300 then S.reportStatus="Sent · "..os.date("%H:%M:%S")
+        elseif code==429 then
+            local retry=60;pcall(function() retry=tonumber(Http:JSONDecode(response.Body).retry_after) or 60 end)
+            S.reportNext=os.clock()+math.max(cfg.ReportInterval,retry+1);S.reportStatus="Rate limited · waiting"
+        elseif code==401 or code==403 or code==404 then set("Reports",false);S.reportStatus="Webhook rejected ("..code..")"
+        else S.reportStatus=code and "HTTP "..code or "Request failed";S.reportNext=os.clock()+math.max(60,cfg.ReportInterval) end
+        if manual then notify(S.reportStatus) end
+    end)
+    return true
+end
+local function save()
+    if type(writefile)~="function" then notify("File saving unavailable.");return end
+    local ok=pcall(writefile,CONFIG,Http:JSONEncode(cfg));notify(ok and "Settings saved." or "Save failed.")
+end
+
+-- Farming controls, reports, report fields, and full library settings.
+local window=Library:Window({Name="Vergil | Autofarm",Size=UDim2.fromOffset(498,598)})
+local footer=window.Items.BottomBar.Instance:FindFirstChildOfClass("TextLabel")
+footer.RichText=false;footer.TextSize=10
+local farmPage=window:Page({Name="farm"})
+local reportsPage=window:Page({Name="reports"})
+local fieldsPage=window:Page({Name="fields"})
+local control=farmPage:Section({Name="autofarm",Side=1})
+local stats=farmPage:Section({Name="session",Side=2})
+local reportControl=reportsPage:Section({Name="discord",Side=1})
+local reportView=reportsPage:Section({Name="preview / status",Side=2})
+local fieldsLeft=fieldsPage:Section({Name="account / totals",Side=1})
+local function toggle(section,key,name)
+    UI.toggles[key]=section:Toggle({Name=name,Flag="autofarm_"..key,Default=cfg[key],Callback=function(v) set(key,v) end})
+end
+local function slider(section,key,name,step)
+    local range=limits[key]
+    UI.sliders[key]=section:Slider({Name=name,Flag="autofarm_"..key,Min=range[1],Max=range[2],
+        Default=cfg[key],Decimals=step,Callback=function(v) set(key,v) end})
+end
+local function text(section,name)
+    local object=section:Label({Name=name}).Items.Text.Instance;object.RichText=false;return object
+end
+toggle(control,"Enabled","autofarm")
+slider(control,"Speed","speed (max 20)",1)
+slider(control,"Depth","underground depth",0.25)
+toggle(control,"ResetOnFull","reset on full")
+toggle(control,"AntiAFK","anti-afk")
+control:Button({Name="stop / return to floor",Callback=function() set("Enabled",false) end})
+control:Button({Name="save settings",Callback=save})
+control:Button({Name="unload",Callback=function() API.Unload() end})
+UI.status=text(stats,"Starting…")
+UI.stats=text(stats,"No collections yet")
+UI.bags=text(stats,"Bag: ?")
+UI.profile=text(stats,"Level: ? / Prestige: ?")
+toggle(stats,"AutoPrestige","auto prestige")
+UI.prestige=text(stats,"Auto prestige: off")
+UI.health=text(stats,"Anti-AFK: enabled")
+reportControl:Textbox({Name="webhook URL",Flag="autofarm_webhook_runtime",Default="",Placeholder="Discord webhook URL",
+    Finished=true,Callback=function(url) if not setWebhook(url) then notify("Use a valid Discord webhook URL.") end end})
+toggle(reportControl,"Reports","send reports")
+slider(reportControl,"ReportInterval","interval (seconds)",30)
+reportControl:Button({Name="preview",Callback=function()
+    local lines={};for _,f in ipairs(payload().embeds[1].fields) do lines[#lines+1]=f.name..": "..f.value end
+    UI.report.Text=table.concat(lines,"\n");S.previewUntil=os.clock()+20
+end})
+reportControl:Button({Name="send now",Callback=function() local ok,reason=sendReport(true);if not ok then notify(reason) end end})
+UI.report=text(reportView,"No URL set")
+for _,entry in ipairs({{"ReportUser","account"},{"ReportLevel","level"},{"ReportPrestige","prestige"},
+    {"ReportCollected","session totals"},{"ReportFarm","farm totals"}}) do toggle(fieldsLeft,entry[1],entry[2]) end
+
+S.gui=new("ScreenGui",{Name="Vergil_Autofarm_HUD",ResetOnSpawn=false,IgnoreGuiInset=true,DisplayOrder=90},Player.PlayerGui)
+local bar=new("Frame",{Name="FarmStatus",Size=UDim2.fromOffset(350,55),AnchorPoint=Vector2.new(0.5,1),
+    Position=UDim2.new(0.5,0,1,-40),BackgroundColor3=Library.Theme.Window,BorderSizePixel=0,Visible=false,Active=true},S.gui)
+new("UIStroke",{Color=Library.Theme.Border,ApplyStrokeMode=Enum.ApplyStrokeMode.Border,
+    BorderStrokePosition=Enum.BorderStrokePosition.Inner},bar)
+new("UIStroke",{Color=Color3.new(0,0,0),Thickness=2,BorderOffset=UDim.new(0,1),
+    ApplyStrokeMode=Enum.ApplyStrokeMode.Border,BorderStrokePosition=Enum.BorderStrokePosition.Inner},bar)
+new("UIShadow",{},bar)
+new("UIGradient",{Rotation=-90,Color=ColorSequence.new(Color3.fromRGB(225,225,225),Color3.fromRGB(201,201,201))},bar)
+local accent=new("Frame",{Size=UDim2.new(1,0,0,1),BackgroundColor3=Library.Theme.Accent,BorderSizePixel=0},bar)
+local function hudText(y,size)
+    return new("TextLabel",{Position=UDim2.fromOffset(9,y),Size=UDim2.new(1,-18,0,17),Text="",
+        BackgroundTransparency=1,FontFace=Library.Font,TextSize=size,TextColor3=Library.Theme.Text,
+        TextXAlignment=Enum.TextXAlignment.Left,TextTruncate=Enum.TextTruncate.AtEnd,TextStrokeTransparency=0.4},bar)
+end
+local barTitle=hudText(5,12);local barStatus=hudText(23,10)
+barStatus.TextColor3=Library.Theme["Dim Text"]
+local track=new("Frame",{Position=UDim2.fromOffset(9,43),Size=UDim2.new(1,-18,0,5),BackgroundColor3=Library.Theme.Background,BorderSizePixel=0},bar)
+new("UIStroke",{Color=Library.Theme.Outline},track)
+local fill=new("Frame",{Size=UDim2.fromScale(0,1),BackgroundColor3=Library.Theme["Element Accent"],BorderSizePixel=0},track)
+local drag
+connect(bar.InputBegan,function(i)
+    if i.UserInputType==Enum.UserInputType.MouseButton1 or i.UserInputType==Enum.UserInputType.Touch then drag={input=i,start=i.Position,position=bar.Position} end
+end)
+connect(Input.InputChanged,function(i)
+    if drag and (i.UserInputType==Enum.UserInputType.MouseMovement or i==drag.input) then
+        local d=i.Position-drag.start;bar.Position=UDim2.new(drag.position.X.Scale,drag.position.X.Offset+d.X,drag.position.Y.Scale,drag.position.Y.Offset+d.Y)
+    end
+end)
+connect(Input.InputEnded,function(i) if drag and i==drag.input then drag=nil end end)
+connect(Input.InputBegan,function(i,processed)
+    if not processed and not Input:GetFocusedTextBox() and i.KeyCode==Enum.KeyCode.X then set("Enabled",false) end
+end)
+connect(Input.WindowFocusReleased,function() drag=nil end)
+
+local gameplay=RS:FindFirstChild("Remotes") and RS.Remotes:FindFirstChild("Gameplay")
+local function event(name,fn)
+    local remote=gameplay and gameplay:FindFirstChild(name)
+    if remote and remote:IsA("RemoteEvent") then connect(remote.OnClientEvent,fn) end
+end
+local function ownData(data)
+    if type(data)~="table" then return end
+    local own=data[Player.Name] or data[tostring(Player.UserId)] or data[Player.UserId]
+    S.own=type(own)=="table" and type(own.Role)=="string" and {Role=own.Role,Dead=own.Dead,Killed=own.Killed} or nil
+    if S.phase=="Syncing" then
+        S.phase=S.own and "Round" or "Lobby"
+        if S.own then S.round=1 end
+    end
+end
+event("PlayerDataChanged",ownData)
+event("RoundStart",function()
+    cancel("New round");S.round=S.round+1;S.phase="Round"
+    S.bags={};S.caps={};S.currencies={};S.anchor=nil;S.point=nil;S.surfaceY=nil;S.doneRound=nil;S.resetRound=nil
+    S.confirmed=setmetatable({},{__mode="k"});S.retry=setmetatable({},{__mode="k"})
+end)
+event("LoadingMap",function() cancel("Loading map");S.phase="Loading";S.own=nil;S.map=nil end)
+event("GameOver",function() cancel("Round ended");S.phase="Ended" end)
+event("RoundEndFade",function() cancel("Round ended");S.phase="Ended" end)
+event("CoinsStarted",function(ids)
+    S.bags={};S.caps={};S.currencies={}
+    S.confirmed=setmetatable({},{__mode="k"});S.retry=setmetatable({},{__mode="k"})
+    if type(ids)=="table" then for id in pairs(ids) do if type(id)=="string" then S.currencies[id]=true end end end
+end)
+-- Existing counters are the baseline, not new session pickups.
+do
+    local main=Player.PlayerGui:FindFirstChild("MainGUI");local gameFrame=main and main:FindFirstChild("Game")
+    local bagFrame=gameFrame and gameFrame:FindFirstChild("CoinBags");local container=bagFrame and bagFrame:FindFirstChild("Container")
+    if container then
+        for _,b in ipairs(container:GetChildren()) do
+            if b:IsA("Frame") and b.Visible then
+                S.currencies[b.Name]=true
+                local c=b:FindFirstChild("CurrencyFrame");local icon=c and c:FindFirstChild("Icon");local count=icon and icon:FindFirstChild("Coins")
+                local amount=count and tonumber(count.Text)
+                if amount then
+                    S.bags[b.Name]=amount
+                    local f=b:FindFirstChild("Full");if amount>0 and f and f:IsA("GuiObject") and f.Visible then S.caps[b.Name]=amount end
+                end
+            end
+        end
+    end
+end
+event("CoinCollected",function(id,count,cap)
+    if type(id)~="string" or type(count)~="number" then return end
+    local delta=math.max(0,count-(S.bags[id] or 0));S.bags[id]=count;S.currencies[id]=true
+    if type(cap)=="number" and cap>0 then S.caps[id]=cap end
+    if delta>0 then
+        S.total[id]=(S.total[id] or 0)+delta
+        if cfg.Enabled or S.kind=="collect" then S.farmed[id]=(S.farmed[id] or 0)+delta end
+        local _,root=character();local nearest,distance=nil,6
+        if root then
+            local target=S.target
+            if target and target.Parent and target:GetAttribute("CoinID")==id and (root.Position-target.Position).Magnitude<6 then nearest=target end
+            local preferred=nearest~=nil
+            for _,part in ipairs(Tags:GetTagged("ServerCoinPart")) do
+                if not preferred and part:IsA("BasePart") and part.Parent and not S.confirmed[part] and part:GetAttribute("CoinID")==id then
+                    local d=(root.Position-part.Position).Magnitude;if d<distance then nearest,distance=part,d end
+                end
+            end
+        end
+        if nearest then S.confirmed[nearest]=visual(nearest) or true end
+    end
+    if full(id) and S.target and S.target:GetAttribute("CoinID")==id then
+        if S.tween then S.tween:Cancel();S.tween=nil end
+    end
+end)
+connect(Player.CharacterAdded,function() cancel("Waiting for next round") end)
+local function requestState()
+    if S.requestPending or not gameplay then return end
+    local remote=gameplay:FindFirstChild("GetCurrentPlayerData")
+    if not remote or not remote:IsA("RemoteFunction") then return end
+    S.requestPending=true;S.requestAt=os.clock()
+    task.spawn(function()
+        local ok,data=pcall(function() return remote:InvokeServer() end)
+        S.requestPending=false;if S.alive and ok then ownData(data) end
+    end)
+end
+task.spawn(function()
+    local modules=RS:FindFirstChild("Modules")
+    if not modules then requestState();return end
+    local current=modules:FindFirstChild("CurrentRoundClient")
+    if current then local ok,m=pcall(require,current);if ok and S.alive then ownData(m.PlayerData) end else requestState() end
+    local p=modules:FindFirstChild("ProfileData");if p then local ok,m=pcall(require,p);if ok and S.alive then S.profile=m end end
+    local l=modules:FindFirstChild("LevelModule");if l then local ok,m=pcall(require,l);if ok and S.alive then S.levels=m end end
+end)
+local function afkPulse()
+    if not cfg.AntiAFK or S.afkPending then return end
+    S.afkPending=true;S.lastAFK=os.clock()
+    task.spawn(function()
+        local ok=pcall(function() VirtualUser:CaptureController();VirtualUser:SetKeyDown("0x12");task.wait(0.08);VirtualUser:SetKeyUp("0x12") end)
+        S.afkOK=ok;S.afkPending=false
+    end)
+end
+connect(Player.Idled,afkPulse)
+connect(Run.PreSimulation,function()
+    local char,root=character()
+    if not root or S.root~=root then return end
+    root.AssemblyLinearVelocity=Vector3.zero;root.AssemblyAngularVelocity=Vector3.zero
+    if S.hold and not S.tween then root.CFrame=S.hold end
+    for _,part in ipairs(char:GetDescendants()) do
+        if part:IsA("BasePart") then
+            if S.collisions[part]==nil then S.collisions[part]=part.CanCollide end
+            part.CanCollide=false
+        end
+    end
+end)
+local clock,uiClock,fraction=0,0,-1
+connect(Run.Heartbeat,function(dt)
+    clock=clock+dt;uiClock=uiClock+dt
+    if clock>=0.15 then clock=0;farmTick() end
+    if uiClock<0.5 then return end;uiClock=0
+    S.map=nil
+    for _,child in ipairs(workspace:GetChildren()) do
+        if child.Name~="Lobby" and (child:IsA("Model") or child:IsA("Folder")) and child:FindFirstChild("CoinContainer") then S.map=child;break end
+    end
+    local p=profile();local collected,total=currencyText(S.total);local _,bagTotal=currencyText(S.bags)
+    local maxTotal=0;for _,cap in pairs(S.caps) do maxTotal=maxTotal+cap end
+    UI.status.Text=S.status.."\n"..S.phase.." / "..(S.map and S.map.Name or "Lobby")
+    UI.stats.Text=collected..string.format("\n%.1f / minute",total*60/math.max(1,os.clock()-S.started))
+    UI.bags.Text="Bags:\n"..currencyText(S.bags)
+    UI.profile.Text=string.format("Level %s\nPrestige %s",p.level or "?",p.prestige or "?")
+    prestigeTick()
+    UI.prestige.Text=S.prestigeStatus
+    UI.health.Text="Anti-AFK: "..(cfg.AntiAFK and (S.afkOK==false and "unavailable" or "on") or "off")
+    if os.clock()>S.previewUntil then UI.report.Text=S.reportStatus..(cfg.Reports and string.format("\nNext in %ds",math.max(0,S.reportNext-os.clock())) or "") end
+    bar.Visible=cfg.Enabled
+    barTitle.Text=string.format("autofarm / %d/%s / %.0f st/s",bagTotal,maxTotal>0 and tostring(maxTotal) or "?",math.clamp(cfg.Speed,5,20))
+    barStatus.Text=S.status:lower()
+    local f=maxTotal>0 and math.clamp(bagTotal/maxTotal,0,1) or 0
+    if math.abs(f-fraction)>0.001 then fraction=f;Tween:Create(fill,TweenInfo.new(0.15),{Size=UDim2.fromScale(f,1)}):Play() end
+    footer.Text=cfg.Enabled and "autofarm on / X: stop" or "autofarm off"
+    local ok,ping=pcall(function() return Player:GetNetworkPing() end)
+    if ok and type(ping)=="number" and ping>0 then S.ping=S.ping*0.75+math.clamp(ping,0.005,1)*0.25 end
+    if os.clock()-S.requestAt>12 then requestState() end
+    if cfg.AntiAFK and os.clock()-S.lastAFK>60 then afkPulse() end
+    if cfg.Reports and not S.reportBusy and os.clock()>=S.reportNext then sendReport(false) end
+end)
+
+API.Set=set
+API.Start=function() set("Enabled",true) end
+API.Stop=function() set("Enabled",false) end
+API.Show=function(value) window:SetOpen(value~=false) end
+API.Save=save
+API.SetWebhook=setWebhook
+API.GetReport=payload
+API.CanPrestige=canPrestige
+API.SendReport=function() return sendReport(true) end
+API.GetStats=function()
+    local p=profile();p.collected=table.clone(S.total);p.farmed=table.clone(S.farmed);p.bags=table.clone(S.bags);p.caps=table.clone(S.caps);p.seconds=os.clock()-S.started;return p
+end
+API.GetStatus=function()
+    local _,root,hum=character();local leg=S.leg or {}
+    return {version=VERSION,enabled=cfg.Enabled,status=S.status,phase=S.phase,round=S.round,map=S.map and S.map.Name or "Lobby",
+        moving=S.busy,kind=S.kind,direct=true,speed=leg.speed,distance=leg.distance,duration=leg.duration,targetY=leg.targetY,
+        rootY=root and root.Position.Y,platformStand=hum and hum.PlatformStand,heldUnderground=S.hold~=nil,
+        candidates=#coins(),finished=finished(),returnedToFloor=S.doneRound==S.round,resetRound=S.resetRound,
+        resetOnFull=cfg.ResetOnFull,antiAFK=cfg.AntiAFK,antiAFKOK=S.afkOK,pingMS=S.ping*2000,reportStatus=S.reportStatus,
+        autoPrestige=cfg.AutoPrestige,prestigeStatus=S.prestigeStatus,prestigeRequests=S.prestigeRequests}
+end
+API.GetErrors=function()
+    local out={};for name,e in pairs(S.errors) do out[name]={count=e.count,message=e.message} end;return out
+end
+Library.Exit=function() API.Unload() end
+farmPage:Turn()
+window:InitWindow()
+if ENV.MM2_WORK_AFK and ENV.MM2_WORK_AFK.Stop then pcall(ENV.MM2_WORK_AFK.Stop);ENV.MM2_WORK_AFK=nil end
+afkPulse()
+notify("Vergil Autofarm ready / RightShift: menu / X: stop")
+print("[Vergil Autofarm] Loaded v"..VERSION..". getgenv().VergilAutofarm.Unload() to remove.")
