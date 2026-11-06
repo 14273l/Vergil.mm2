@@ -1,6 +1,3 @@
-
--- stop ask what the menu button is pls yo  its RightShift: menu | X: stop and return to the floor.
--- Dedicated collectible farming. Uses the requested Vergil UI library.
 local ENV=(getgenv and getgenv()) or _G
 if ENV.VergilAutofarm and ENV.VergilAutofarm.Unload then pcall(ENV.VergilAutofarm.Unload) end
 if game.PlaceId~=142823291 then warn("[Vergil Autofarm] MM2 only.");return end
